@@ -1,0 +1,419 @@
+"""
+FSR Monitor - Interface PC pour le projet FIEC
+
+Rôle de ce script :
+- Piloter une carte Arduino qui envoie des mesures de capteur FSR.
+- Dialoguer via un protocole simple :
+    * 'r' : calibrage + démarrage du streaming côté Arduino
+    * 's' : arrêt du streaming côté Arduino
+    * trames au format "time_ms,value" envoyées en continu
+
+Fonctionnalités :
+- Choix du préfixe de fichier, numéro d'essai et dossier de sauvegarde.
+- Bouton Start (10s) :
+    * ouvre le port série
+    * envoie 'r'
+    * lit les trames "time_ms,value" pendant 10 secondes
+    * enregistre les données dans prefix_Txx.csv
+    * incrémente automatiquement le numéro d'essai
+- Bouton Stop :
+    * permet d'interrompre manuellement un essai avant 10s
+- Affichage temps réel des trames reçues dans une zone type "moniteur série".
+
+Étapes du sujet couvertes par ce script :
+- Step 6 : acquisition, affichage et enregistrement sur 10s
+- Step 7 : gestion multi-essais (T01, T02, ...)
+- Step 8 : IHM de contrôle côté PC
+
+Dépendances :
+- Python 3
+- tkinter (inclus avec Python)
+- pyserial (`pip install pyserial`)
+"""
+
+import tkinter as tk
+from tkinter import filedialog, scrolledtext
+import os
+import time
+import serial
+from serial import SerialException
+
+# ========== CONFIG À ADAPTER ==========
+# Port série de la carte Arduino :
+#  - MacOS  : '/dev/cu.usbmodemXXXX'
+ARDUINO_PORT = '/dev/cu.usbmodem34B7DA6494902'
+
+# Doit matcher Serial.begin(...) sur Arduino
+BAUDRATE = 1000000
+
+# Durée d'un essai en secondes
+TRIAL_DURATION_SEC = 10
+# ======================================
+
+
+class SerialFSR:
+    """
+    Classe utilitaire pour gérer la liaison série avec l'Arduino.
+
+    Protocole côté Arduino (code fsr_fiec_step3_4.ino) :
+      - 'r' reçu :
+          * calibration du FSR
+          * mise à jour de la baseline
+          * mise à zéro du temps (t0 = millis())
+          * début du streaming
+      - 's' reçu :
+          * arrêt du streaming
+      - données envoyées :
+          * lignes texte au format : "time_ms,value"
+            ex: "37,12"
+    """
+
+    def __init__(self, port: str, baudrate: int = 1000000):
+        self.port = port
+        self.baudrate = baudrate
+        self.ser: serial.Serial | None = None
+
+    def start(self):
+        """
+        Ouvre le port série et envoie 'r' pour démarrer un essai.
+
+        Étapes :
+        - ouverture du port
+        - courte attente (reset Arduino)
+        - flush du buffer
+        - envoi de 'r' pour lancer calibration + streaming
+        """
+        try:
+            self.ser = serial.Serial(
+                self.port,
+                self.baudrate,
+                timeout=0.01  # lecture rapide et peu bloquante
+            )
+        except SerialException as e:
+            raise RuntimeError(f"Impossible d'ouvrir le port série : {e}")
+
+        # Sur beaucoup de cartes, l'ouverture du port déclenche un reset
+        time.sleep(2.0)
+
+        # On vide les messages "Ready...", etc.
+        self.ser.reset_input_buffer()
+
+        # Envoi de la commande de démarrage
+        try:
+            self.ser.write(b'r')
+            self.ser.flush()
+        except SerialException as e:
+            raise RuntimeError(f"Erreur lors de l'envoi de 'r' : {e}")
+
+    def read_value(self):
+        """
+        Lit une ligne provenant de l'Arduino.
+
+        Retour :
+            (time_ms, value)  si la ligne est du type "entier,entier"
+            None              si la ligne n'est pas exploitable
+        """
+        if not self.ser or not self.ser.is_open:
+            return None
+
+        try:
+            line = self.ser.readline().decode(errors='ignore').strip()
+        except SerialException:
+            return None
+
+        if not line:
+            return None
+
+        # On attend "time_ms,value"
+        if ',' not in line:
+            # Lignes texte ("Calibrating...", etc.) -> ignorées
+            return None
+
+        try:
+            t_str, v_str = line.split(',', 1)
+            t_ms = int(t_str)
+            value = int(v_str)
+            return t_ms, value
+        except ValueError:
+            # Format non conforme -> on ignore
+            return None
+
+    def stop(self):
+        """
+        Envoie 's' pour arrêter le streaming puis ferme le port série.
+
+        Cette fonction est appelée à la fin d'un essai
+        (automatiquement ou après un Stop manuel).
+        """
+        if self.ser and self.ser.is_open:
+            try:
+                # On demande l'arrêt propre côté Arduino
+                self.ser.write(b's')
+                self.ser.flush()
+                time.sleep(0.05)
+            except SerialException:
+                pass
+
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+
+        self.ser = None
+
+
+class FSRApp:
+    """
+    IHM Tkinter pour piloter les essais FSR.
+
+    - Start (10s) : crée un fichier CSV, démarre la liaison série,
+                    lit les valeurs Arduino -> sauvegarde "time_ms,value"
+    - Stop        : arrêt manuel possible avant les 10s
+    - Quitter     : ferme proprement série + fichier
+    """
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("FSR Monitor - Essais automatiques 10s (Arduino)")
+
+        # État interne
+        self.running = False            # indique si un essai est en cours
+        self.start_time = None          # temps PC pour gérer la durée 10s
+        self.current_trial_file = None  # fichier CSV ouvert pour l'essai
+        self.fsr: SerialFSR | None = None
+
+        # ---------- Interface graphique ----------
+        row = 0
+        tk.Label(
+            root,
+            text=f"Mode : Arduino ({ARDUINO_PORT}) - 10s par essai"
+        ).grid(row=row, column=0, columnspan=4,
+               sticky="w", padx=5, pady=5)
+
+        # Préfixe de fichier
+        row += 1
+        tk.Label(root, text="Préfixe fichier :").grid(
+            row=row, column=0, sticky="e", padx=5, pady=5
+        )
+        self.prefix_var = tk.StringVar(value="Sujet01_FSR")
+        tk.Entry(root, textvariable=self.prefix_var, width=20).grid(
+            row=row, column=1, sticky="w", padx=5, pady=5
+        )
+
+        # Numéro d'essai
+        tk.Label(root, text="Numéro essai :").grid(
+            row=row, column=2, sticky="e", padx=5, pady=5
+        )
+        self.trial_var = tk.StringVar(value="1")
+        tk.Entry(root, textvariable=self.trial_var, width=6).grid(
+            row=row, column=3, sticky="w", padx=5, pady=5
+        )
+
+        # Dossier cible
+        row += 1
+        tk.Label(root, text="Dossier cible :").grid(
+            row=row, column=0, sticky="e", padx=5, pady=5
+        )
+        self.folder_var = tk.StringVar(value=os.getcwd())
+        tk.Entry(root, textvariable=self.folder_var, width=40).grid(
+            row=row, column=1, columnspan=2,
+            sticky="w", padx=5, pady=5
+        )
+        tk.Button(root, text="Parcourir",
+                  command=self.choose_folder).grid(
+            row=row, column=3, sticky="w", padx=5, pady=5
+        )
+
+        # État texte
+        row += 1
+        tk.Label(root, text="État :").grid(
+            row=row, column=0, sticky="e", padx=5, pady=5
+        )
+        self.status_var = tk.StringVar(value="En attente")
+        self.status_label = tk.Label(
+            root, textvariable=self.status_var, fg="orange"
+        )
+        self.status_label.grid(
+            row=row, column=1, columnspan=3,
+            sticky="w", padx=5, pady=5
+        )
+
+        # Boutons
+        row += 1
+        tk.Button(
+            root, text="Start (10s)",
+            command=self.start_trial,
+            bg="#2e7d32", fg="white", width=12
+        ).grid(row=row, column=0, padx=5, pady=5)
+
+        tk.Button(
+            root, text="Stop",
+            command=self.stop_trial,
+            bg="#c62828", fg="white", width=12
+        ).grid(row=row, column=1, padx=5, pady=5)
+
+        tk.Button(
+            root, text="Quitter",
+            command=self.quit, width=10
+        ).grid(row=row, column=3, padx=5, pady=5, sticky="e")
+
+        # Zone de log (affichage des trames reçues)
+        row += 1
+        self.log = scrolledtext.ScrolledText(
+            root, width=90, height=20, state="disabled"
+        )
+        self.log.grid(row=row, column=0,
+                      columnspan=4, padx=5, pady=5)
+
+    # ---------- Utilitaires UI ----------
+
+    def choose_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.folder_var.get())
+        if folder:
+            self.folder_var.set(folder)
+
+    def set_status(self, text: str, color: str = "orange"):
+        self.status_var.set(text)
+        self.status_label.config(fg=color)
+
+    def log_print(self, text: str):
+        """Ajoute une ligne dans la zone de log."""
+        self.log.configure(state="normal")
+        self.log.insert(tk.END, text + "\n")
+        self.log.see(tk.END)
+        self.log.configure(state="disabled")
+
+    # ---------- Gestion d'un essai ----------
+
+    def start_trial(self):
+        """Démarre un essai de 10s : fichier + série + lecture."""
+        if self.running:
+            return  # déjà un essai en cours
+
+        prefix = self.prefix_var.get().strip()
+        trial_str = self.trial_var.get().strip()
+        folder = self.folder_var.get().strip()
+
+        # Vérifications basiques
+        if not prefix or not folder or not trial_str.isdigit():
+            self.set_status("Erreur : vérifie préfixe / essai / dossier", "red")
+            return
+
+        trial = int(trial_str)
+
+        # Préparation du fichier de sortie
+        os.makedirs(folder, exist_ok=True)
+        filename = f"{prefix}_T{trial:02d}.csv"
+        filepath = os.path.join(folder, filename)
+
+        try:
+            self.current_trial_file = open(filepath, "w")
+        except Exception as e:
+            self.set_status("Erreur ouverture fichier", "red")
+            self.log_print(f"Erreur : {e}")
+            self.current_trial_file = None
+            return
+
+        # Initialisation série + commande 'r'
+        try:
+            self.fsr = SerialFSR(ARDUINO_PORT, BAUDRATE)
+            self.fsr.start()
+        except RuntimeError as e:
+            self.set_status("Erreur série", "red")
+            self.log_print(str(e))
+            if self.current_trial_file:
+                self.current_trial_file.close()
+                self.current_trial_file = None
+            self.fsr = None
+            return
+
+        # Lancement de l'essai (côté PC : minuterie 10s)
+        self.running = True
+        self.start_time = time.time()
+        self.set_status(f"Essai T{trial:02d} en cours (10s)", "green")
+        self.log_print(f">>> Start T{trial:02d}, fichier : {filepath}")
+
+        # Boucle de lecture non bloquante
+        self.schedule_read()
+
+    def schedule_read(self):
+        """
+        Fonction appelée régulièrement (via after) pendant l'essai.
+        Lit les valeurs Arduino et arrête au bout de TRIAL_DURATION_SEC.
+        """
+        if not self.running:
+            return
+
+        # Gestion de la durée de l'essai (10s)
+        elapsed = time.time() - self.start_time
+        if elapsed >= TRIAL_DURATION_SEC:
+            self.stop_trial(auto=True)
+            return
+
+        # Lecture d'une valeur (time_ms, value)
+        result = self.fsr.read_value() if self.fsr else None
+
+        if result is not None:
+            t_ms, value = result
+
+            # On log exactement ce que fournit l'Arduino
+            line = f"{t_ms},{value}"
+            self.log_print(line)
+
+            if self.current_trial_file:
+                self.current_trial_file.write(line + "\n")
+
+        # Replanifie une prochaine lecture (5 ms -> cohérent avec ~100 Hz)
+        self.root.after(5, self.schedule_read)
+
+    def stop_trial(self, auto: bool = False):
+        """
+        Fin d'essai :
+        - envoi 's' + fermeture série
+        - fermeture fichier
+        - incrément du numéro d'essai
+        """
+        if not self.running:
+            return
+
+        self.running = False
+
+        # Stop côté Arduino + fermeture port
+        if self.fsr:
+            self.fsr.stop()
+            self.fsr = None
+
+        # Fermeture fichier
+        if self.current_trial_file:
+            self.current_trial_file.close()
+            self.current_trial_file = None
+
+        # Incrémente Txx
+        try:
+            trial = int(self.trial_var.get())
+        except ValueError:
+            trial = 1
+        self.trial_var.set(str(trial + 1))
+
+        if auto:
+            self.set_status("Essai terminé automatiquement (10s)", "orange")
+            self.log_print(">>> Essai terminé automatiquement (10s).")
+        else:
+            self.set_status("Essai interrompu manuellement", "red")
+            self.log_print(">>> Essai stoppé manuellement.")
+
+    def quit(self):
+        """Quitte l'application proprement."""
+        self.running = False
+        if self.fsr:
+            self.fsr.stop()
+        if self.current_trial_file:
+            self.current_trial_file.close()
+        self.root.destroy()
+
+
+# ---------- Point d'entrée ----------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FSRApp(root)
+    root.mainloop()
