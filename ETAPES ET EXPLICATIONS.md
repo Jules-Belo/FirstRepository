@@ -33,4 +33,3 @@ Avec le script **Python (`fsr_gui_arduino.py`)** et le code **Arduino actuel**, 
 
 **Bilan :**  
 → Le script Python complète les **Steps 6 à 8**, tout en exploitant les **Steps 1 à 5** réalisés sur Arduino.  
-Tu disposes ainsi d’une chaîne complète de mesure et d’enregistrement automatisée entre le capteur FSR et le PC.
