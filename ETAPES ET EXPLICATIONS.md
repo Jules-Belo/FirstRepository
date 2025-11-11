@@ -1,10 +1,10 @@
 # 1️⃣ Étapes du projet couvertes par ce code Arduino
 
 ### Avec ce code :
-•	**Step 1** – Synchronisation 1
-  •	Vitesse série : Serial.begin(1000000); ✅
-  •	Démarrage de l’acquisition uniquement après réception de 'r' ✅
-•	**Step 2** – Synchronisation 2
+- **Step 1** – Synchronisation 1
+-   Vitesse série : Serial.begin(1000000); ✅
+-   Dmarrage de l’acquisition uniquement après réception de 'r' ✅
+- Step 2** – Synchronisation 2
   •	Commande 's' pour arrêter le streaming proprement (started = false, LED ON, message) ✅
 •	**Step 3** – Comptage temporel
   •	Utilisation de millis() et mémorisation d’un t0 au moment du 'r'. ✅
