@@ -1,0 +1,104 @@
+// -----------------------------------------------------------------------------
+// Projet FSR - Arduino
+// Protocole:
+//   - 'r' reçu sur la liaison série : calibration + démarrage de l'acquisition
+//   - 's' reçu : arrêt de l'acquisition
+//   - Envoi en continu de lignes au format: time_ms,value
+//       * time_ms : temps en millisecondes depuis le dernier 'r'
+//       * value   : valeur FSR (lecture analogique - baseline, saturée à 0)
+// Vitesse série : 1 000 000 bauds (doit correspondre au PC)
+// -----------------------------------------------------------------------------
+
+#define FORCE_SENSOR_PIN A0      // Entrée analogique connectée au FSR
+#define LED_PIN LED_BUILTIN      // LED intégrée pour l'état
+
+bool started = false;            // Indique si l'acquisition est en cours
+int baseline = 0;                // Valeur moyenne au repos (sans pression)
+unsigned long t0 = 0;            // Temps de référence (ms) au début de l'essai
+
+void setup() {
+  // Initialisation de la communication série à 1 Mbit/s
+  Serial.begin(1000000);
+
+  // LED intégrée utilisée comme indicateur d'état
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);   // HIGH = en attente de commande
+
+  // Message d'information pour le PC / moniteur série
+  Serial.println("Ready. Send 'r' to start. Send 's' to stop.");
+}
+
+void loop() {
+  // --- Lecture des commandes reçues sur le port série ---
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+
+    // ----- Commande START : 'r' ou 'R' -----
+    if (c == 'r' || c == 'R') {
+      Serial.println("Calibrating... Do not touch the sensor.");
+
+      // Calcule la baseline (moyenne des lectures au repos)
+      baseline = calibrateFSR();
+
+      Serial.print("Baseline = ");
+      Serial.println(baseline);
+      Serial.println("Streaming started.");
+
+      // Active le mode acquisition
+      started = true;
+
+      // Définit le temps zéro pour cet essai
+      t0 = millis();
+
+      // LED OFF : indique que l'acquisition est en cours
+      digitalWrite(LED_PIN, LOW);
+    }
+
+    // ----- Commande STOP : 's' ou 'S' -----
+    else if (c == 's' || c == 'S') {
+      // Désactive le mode acquisition
+      started = false;
+
+      // LED ON : retour à l'état d'attente
+      digitalWrite(LED_PIN, HIGH);
+
+      Serial.println("Streaming stopped.");
+    }
+  }
+
+  // --- Si l'acquisition est active : envoi des mesures ---
+  if (started) {
+    // Temps écoulé depuis le début de l'essai (en millisecondes)
+    unsigned long t = millis() - t0;
+
+    // Lecture brute du capteur FSR
+    int raw = analogRead(FORCE_SENSOR_PIN);
+
+    // Soustraction de la baseline (calibration)
+    int value = raw - baseline;
+    if (value < 0) value = 0;  // On évite les valeurs négatives
+
+    // Envoi au format: temps_ms,valeur
+    Serial.print(t);
+    Serial.print(',');
+    Serial.println(value);
+
+    // Fréquence d'échantillonnage ~100 Hz
+    delay(10);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Fonction de calibration : mesure la valeur moyenne au repos
+// -----------------------------------------------------------------------------
+int calibrateFSR() {
+  long total = 0;
+  const int samples = 100;  // nombre d'échantillons pour la moyenne
+
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(FORCE_SENSOR_PIN);
+    delay(5);               // petit délai entre chaque mesure
+  }
+
+  return total / samples;   // moyenne entière
+}
