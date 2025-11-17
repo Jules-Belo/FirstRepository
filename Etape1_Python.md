@@ -37,9 +37,10 @@ except Exception as e:
 finally:
     ser.close()
     print("Port série fermé.")
-``
+```
 
 ## Code prof peu fonctionnel
+
 ```python
 import serial
 from serial.serialutil import SerialException
