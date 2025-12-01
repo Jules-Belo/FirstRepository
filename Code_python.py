@@ -1,9 +1,13 @@
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 ## COUCOU
 
 import serial
 from serial import SerialException
 import time
+import matplotlib.pyplot as plt
 
 PORT = '/dev/cu.usbmodem34B7DA6494902'
 BAUDRATE = 1000000
@@ -24,7 +28,7 @@ ser.write(b'r')
 ser.flush()
 
 dt = 0.01  # 100 Hz
-t0 = time.time()
+t0_pc = time.time()
 
 print("Acquisition en cours ...")
 
@@ -45,13 +49,15 @@ try:
                 t_str, v_str = line.split(',', 1)
                 t_ms = int(t_str)
                 val = float(v_str)
+
+                # Temps relatif envoyé par l'Arduino (en secondes)
                 times.append(t_ms / 1000.0)
                 values.append(val)
             except ValueError:
                 pass
 
         # Reset après ~10 s
-        if time.time() - t0 > 10:
+        if time.time() - t0_pc > 10:
             ser.write(b'x')
             ser.flush()
             break
@@ -65,9 +71,33 @@ finally:
     ser.close()
     print("Port fermé")
 
-# Résumé en dehors de la boucle
-if times:
-    print(f"t0 = {times[0]:.3f} s, t_end = {times[-1]:.3f} s")
-    print(f"val min = {min(values):.3f}, val max = {max(values):.3f}")
-else:
+# -----------------------------
+#   RÉSUMÉ + TRAÇAGE + SAVE
+# -----------------------------
+if not times:
     print("Aucune donnée reçue (times[] est vide).")
+else:
+    # On rend le temps relatif au début de l'essai
+    t0_rel = times[0]
+    times_rel = [t - t0_rel for t in times]
+
+    print(f"t0 = {times_rel[0]:.3f} s, t_end = {times_rel[-1]:.3f} s")
+    print(f"val min = {min(values):.3f}, val max = {max(values):.3f}")
+
+    # ---- 1) Affichage du signal (graphe temporel) ----
+    plt.figure()
+    plt.plot(times_rel, values)
+    plt.xlabel("Temps (s)")
+    plt.ylabel("Valeur calibrée")
+    plt.title("Step 6 - Signal jauge de contrainte")
+    plt.grid(True)
+    plt.show()
+
+    # ---- 2) Enregistrement dans un fichier ----
+    filename = "step6_signal.csv"
+    with open(filename, "w") as f:
+        f.write("time_s,value\n")
+        for t, v in zip(times_rel, values):
+            f.write(f"{t:.6f},{v:.6f}\n")
+
+    print(f"Fichier enregistré : {filename}")
