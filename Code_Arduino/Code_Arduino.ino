@@ -1,15 +1,17 @@
-#include <avr/wdt.h>
-
 bool started = false;
 unsigned long t0 = 0;
 
-#define FORCE_SENSOR_PIN A0  // FSR sur A0
+#define GAUGE_PIN A0
+
+// Calibration (à ajuster)
+const int OFFSET = 512;
+const float GAIN = 0.005f;
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);   // attente
+  digitalWrite(LED_BUILTIN, HIGH);
 
-  Serial.begin(1000000, SERIAL_8N1);
+  Serial.begin(1000000);
   Serial.println("Ready. Waiting for 'r'...");
 }
 
@@ -30,26 +32,23 @@ void loop() {
     // ----- GET SAMPLE -----
     if (started && c == 'g') {
 
-      unsigned long t = millis() - t0;     // comptage temporel en ms
-      int raw = analogRead(FORCE_SENSOR_PIN);
+      unsigned long t = millis() - t0;
+      int raw = analogRead(GAUGE_PIN);
 
-      // Buffer texte pour sprintf
+      float calibrated = (raw - OFFSET) * GAIN;
+
       char buffer[32];
-      // Format "time_ms,value"
-      sprintf(buffer, "%lu,%d", t, raw);
+      sprintf(buffer, "%lu,%.3f", t, calibrated);
 
       Serial.println(buffer);
-      Serial.flush();   // on force l'envoi immédiat
+      Serial.flush();
     }
 
-    // ----- SOFTWARE RESET -----
+    // ----- SOFTWARE RESET (UNO R4) -----
     if (c == 'x') {
       Serial.println("Software reset requested...");
       Serial.flush();
-
-      // Active un reset watchdog immédiat
-      wdt_enable(WDTO_15MS);
-      while (1) {}  // boucle pour déclencher le reset
+      NVIC_SystemReset();   // reset matériel Cortex-M
     }
   }
 }
