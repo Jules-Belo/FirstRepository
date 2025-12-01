@@ -2,38 +2,33 @@
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Étape 1 — Envoi du caractère 'r' à l'Arduino pour démarrer la loop
-"""
 
 import serial
 from serial.serialutil import SerialException
+import time
 
-serialPort = serial.Serial();
-serialPort.baudrate = 1000000;
-serialPort.port = '/dev/cu.usbmodem34B7DA6494902';
-serialPort.parity = serial. PARITY_NONE;
-serialPort.stopbits = serial.STOPBITS_ONE;
-serialPort.bytesize = serial. EIGHTBITS;
+PORT = '/dev/cu.usbmodem34B7DA6494902'
+BAUDRATE = 1000000
 
-try :
-    serialPort.open();
-except SerialException as serialException:
-    print(serialException)
-
-if(not serialPort.isOpen()):
-    print('Serial port not opened')
+try:
+    ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
+except SerialException as e:
+    print("Erreur ouverture port :", e)
     exit()
 
-try :
-    print('Serial port opened. Write run character.')
-    cmd = "r";
-    serialPort.write(cmd.encode(encoding='ascii'))
-    serialPort.close()
-    print('Port closed')
-except Exception as exception:
-    print( 'Exception occurred while writing run character')
-    print(exception)
-    serialPort.close()
-    print('Port Close')
+if not ser.is_open:
+    print("Port non ouvert")
+    exit()
 
+print("Port ouvert, envoi de 'r'")
+ser.write(b'r')
+ser.flush()
+
+t0 = time.time()
+while time.time() - t0 < 2.0:
+    line = ser.readline().decode(errors='ignore').strip()
+    if line:
+        print("Arduino >", line)
+
+ser.close()
+print("Port fermé")
