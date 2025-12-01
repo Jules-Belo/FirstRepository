@@ -24,17 +24,22 @@ void loop() {
       t0 = millis();
       digitalWrite(LED_BUILTIN, LOW);
       Serial.println("Start command received.");
+      Serial.flush();
     }
 
     // ----- GET SAMPLE -----
     if (started && c == 'g') {
-      unsigned long t = millis() - t0;
+
+      unsigned long t = millis() - t0;     // comptage temporel en ms
       int raw = analogRead(FORCE_SENSOR_PIN);
 
+      // Buffer texte pour sprintf
+      char buffer[32];
       // Format "time_ms,value"
-      Serial.print(t);
-      Serial.print(',');
-      Serial.println(raw);
+      sprintf(buffer, "%lu,%d", t, raw);
+
+      Serial.println(buffer);
+      Serial.flush();   // on force l'envoi immédiat
     }
 
     // ----- SOFTWARE RESET -----
