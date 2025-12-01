@@ -3,6 +3,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+
 import serial
 import time
 
@@ -16,23 +17,30 @@ print("Envoi 'r' pour démarrer")
 ser.write(b'r')
 ser.flush()
 
-# Acquisition 100 Hz = 10 ms
-dt = 0.01  # 10 ms
+dt = 0.01  # 100 Hz
+t0 = time.time()
 
 print("Acquisition en cours...")
 try:
     while True:
-        ser.write(b'g')   # demande un échantillon
+        ser.write(b'g')
         ser.flush()
 
         line = ser.readline().decode(errors='ignore').strip()
         if line:
             print("Arduino >", line)
 
+        # RESET 10s
+        if time.time() - t0 > 10:
+            print("Envoi du reset 'x'")
+            ser.write(b'x')
+            ser.flush()
+            break
+
         time.sleep(dt)
 
 except KeyboardInterrupt:
-    print("Arrêt demandé")
+    print("Arrêt manuel")
 
 ser.close()
 print("Port fermé")
