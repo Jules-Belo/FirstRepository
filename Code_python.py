@@ -4,31 +4,35 @@
 # -*- coding: utf-8 -*-
 
 import serial
-from serial.serialutil import SerialException
 import time
 
 PORT = '/dev/cu.usbmodem34B7DA6494902'
 BAUDRATE = 1000000
 
-try:
-    ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
-except SerialException as e:
-    print("Erreur ouverture port :", e)
-    exit()
+ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
+time.sleep(2)
 
-if not ser.is_open:
-    print("Port non ouvert")
-    exit()
-
-print("Port ouvert, envoi de 'r'")
+print("Envoi 'r' pour démarrer")
 ser.write(b'r')
 ser.flush()
 
-t0 = time.time()
-while time.time() - t0 < 2.0:
-    line = ser.readline().decode(errors='ignore').strip()
-    if line:
-        print("Arduino >", line)
+# Acquisition 100 Hz = 10 ms
+dt = 0.01  # 10 ms
+
+print("Acquisition en cours...")
+try:
+    while True:
+        ser.write(b'g')   # demande un échantillon
+        ser.flush()
+
+        line = ser.readline().decode(errors='ignore').strip()
+        if line:
+            print("Arduino >", line)
+
+        time.sleep(dt)
+
+except KeyboardInterrupt:
+    print("Arrêt demandé")
 
 ser.close()
 print("Port fermé")
