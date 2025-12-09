@@ -4,123 +4,312 @@
 
 ## COUCOU
 
+import tkinter as tk
+from tkinter import filedialog, scrolledtext
+import os
+import time
 import serial
 from serial import SerialException
-import time
-import os
-import matplotlib.pyplot as plt
 
+# ========= CONFIG À ADAPTER ==========
 PORT = '/dev/cu.usbmodem34B7DA6494902'
 BAUDRATE = 1000000
-
-# ---- Paramètres expérimentaux ----
-TRIAL_DURATION = 10.0      # durée d'un essai en secondes
-DT = 0.01                  # période de demande d'échantillon (~100 Hz)
-NB_TRIALS = 3              # nombre d'essais à enchaîner
-PREFIX = "Sujet01"         # préfixe des fichiers
-FOLDER = "data"      # dossier de sauvegarde
-SHOW_PLOTS = True          # True = affiche un graphe par essai
-# ----------------------------------
+TRIAL_DURATION = 10.0   # durée d'un essai en secondes
+DT = 0.01               # période d'envoi des 'g' (100 Hz)
+# =====================================
 
 
-os.makedirs(FOLDER, exist_ok=True)
+class GaugeApp:
+    """
+    IHM simple pour piloter la jauge via Arduino UNO R4.
 
-for trial in range(1, NB_TRIALS + 1):
-    print(f"\n=== Essai T{trial:02d} ===")
+    - Bouton Start (10 s) :
+        * ouvre le port série
+        * envoie 'r'
+        * crée un fichier CSV
+        * envoie périodiquement 'g'
+        * lit "time_ms,calibrated" pendant 10 s
+    - Bouton Stop :
+        * envoie 'x' (reset Arduino)
+        * ferme port + fichier
+    - Affiche les trames reçues dans une zone de log.
+    """
 
-    times = []   # temps en secondes (relatifs Arduino)
-    values = []  # valeurs calibrées
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("IHM jauge de contrainte (UNO R4)")
 
-    # ----- Ouverture du port série -----
-    try:
-        ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
-    except SerialException as e:
-        print("Impossible d'ouvrir le port série :", e)
-        break
+        # État interne
+        self.running = False
+        self.ser: serial.Serial | None = None
+        self.file = None
+        self.start_time_pc = None
 
-    time.sleep(2)  # temps pour que la UNO R4 redémarre
-    ser.reset_input_buffer()
+        # --- Ligne 1 : info mode ---
+        row = 0
+        tk.Label(
+            root,
+            text=f"Port Arduino : {PORT} - Durée essai : {TRIAL_DURATION:.0f} s"
+        ).grid(row=row, column=0, columnspan=4, sticky="w", padx=5, pady=5)
 
-    print("Envoi 'r' pour démarrer")
-    ser.write(b'r')
-    ser.flush()
+        # --- Ligne 2 : préfixe et numéro d'essai ---
+        row += 1
+        tk.Label(root, text="Préfixe fichier :").grid(
+            row=row, column=0, sticky="e", padx=5, pady=5
+        )
+        self.prefix_var = tk.StringVar(value="Sujet01")
+        tk.Entry(root, textvariable=self.prefix_var, width=20).grid(
+            row=row, column=1, sticky="w", padx=5, pady=5
+        )
 
-    t0_pc = time.time()
-    print("Acquisition en cours ...")
+        tk.Label(root, text="Essai n° :").grid(
+            row=row, column=2, sticky="e", padx=5, pady=5
+        )
+        self.trial_var = tk.StringVar(value="1")
+        tk.Entry(root, textvariable=self.trial_var, width=6).grid(
+            row=row, column=3, sticky="w", padx=5, pady=5
+        )
 
-    try:
-        while True:
-            # Demande un échantillon
-            ser.write(b'g')
-            ser.flush()
+        # --- Ligne 3 : dossier cible ---
+        row += 1
+        tk.Label(root, text="Dossier :").grid(
+            row=row, column=0, sticky="e", padx=5, pady=5
+        )
+        self.folder_var = tk.StringVar(value=os.getcwd())
+        tk.Entry(root, textvariable=self.folder_var, width=40).grid(
+            row=row, column=1, columnspan=2, sticky="w", padx=5, pady=5
+        )
+        tk.Button(root, text="Parcourir", command=self.choose_folder).grid(
+            row=row, column=3, sticky="w", padx=5, pady=5
+        )
 
-            try:
-                line = ser.readline().decode(errors='ignore').strip()
-            except SerialException as e:
-                print("Erreur série pendant la lecture :", e)
-                break
+        # --- Ligne 4 : statut ---
+        row += 1
+        tk.Label(root, text="État :").grid(
+            row=row, column=0, sticky="e", padx=5, pady=5
+        )
+        self.status_var = tk.StringVar(value="En attente")
+        self.status_label = tk.Label(root, textvariable=self.status_var, fg="orange")
+        self.status_label.grid(
+            row=row, column=1, columnspan=3, sticky="w", padx=5, pady=5
+        )
 
-            if line and ',' in line:
+        # --- Ligne 5 : boutons ---
+        row += 1
+        tk.Button(
+            root, text="Start (10 s)",
+            command=self.start_trial,
+            bg="#2e7d32", fg="white", width=12
+        ).grid(row=row, column=0, padx=5, pady=5)
+
+        tk.Button(
+            root, text="Stop",
+            command=self.stop_trial,
+            bg="#c62828", fg="white", width=12
+        ).grid(row=row, column=1, padx=5, pady=5)
+
+        tk.Button(
+            root, text="Quitter",
+            command=self.quit_app, width=10
+        ).grid(row=row, column=3, padx=5, pady=5, sticky="e")
+
+        # --- Ligne 6 : log série ---
+        row += 1
+        self.log = scrolledtext.ScrolledText(root, width=90, height=20, state="disabled")
+        self.log.grid(row=row, column=0, columnspan=4, padx=5, pady=5)
+
+    # ----------------- Utils UI -----------------
+
+    def choose_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.folder_var.get())
+        if folder:
+            self.folder_var.set(folder)
+
+    def set_status(self, text: str, color: str = "orange"):
+        self.status_var.set(text)
+        self.status_label.config(fg=color)
+
+    def log_print(self, text: str):
+        self.log.config(state="normal")
+        self.log.insert(tk.END, text + "\n")
+        self.log.see(tk.END)
+        self.log.config(state="disabled")
+
+    # ----------------- Gestion essai -----------------
+
+    def start_trial(self):
+        """Démarre un essai de TRIAL_DURATION secondes."""
+        if self.running:
+            return  # Essai déjà en cours
+
+        prefix = self.prefix_var.get().strip()
+        folder = self.folder_var.get().strip()
+        trial_str = self.trial_var.get().strip()
+
+        if not prefix or not folder or not trial_str.isdigit():
+            self.set_status("Erreur : préfixe / essai / dossier", "red")
+            return
+
+        trial = int(trial_str)
+
+        # Préparation fichier
+        os.makedirs(folder, exist_ok=True)
+        filename = f"{prefix}_T{trial:02d}.csv"
+        filepath = os.path.join(folder, filename)
+
+        try:
+            self.file = open(filepath, "w")
+            self.file.write("time_s,value\n")  # en-tête
+        except Exception as e:
+            self.set_status("Erreur ouverture fichier", "red")
+            self.log_print(f"Erreur fichier : {e}")
+            self.file = None
+            return
+
+        # Ouverture série
+        try:
+            self.ser = serial.Serial(PORT, BAUDRATE, timeout=0.05)
+        except SerialException as e:
+            self.set_status("Erreur port série", "red")
+            self.log_print(f"Erreur série : {e}")
+            self.file.close()
+            self.file = None
+            self.ser = None
+            return
+
+        time.sleep(2.0)  # reset UNO R4 après ouverture
+        self.ser.reset_input_buffer()
+
+        # Envoi 'r'
+        try:
+            self.ser.write(b'r')
+            self.ser.flush()
+        except SerialException as e:
+            self.set_status("Erreur envoi 'r'", "red")
+            self.log_print(f"Erreur série : {e}")
+            self.cleanup_serial_file()
+            return
+
+        self.running = True
+        self.start_time_pc = time.time()
+        self.set_status(f"Essai T{trial:02d} en cours ({TRIAL_DURATION:.0f} s)", "green")
+        self.log_print(f">>> Start T{trial:02d}, fichier : {filepath}")
+
+        # Lancer la boucle de lecture/écriture non bloquante
+        self.schedule_read()
+
+    def schedule_read(self):
+        """Tâche périodique : demande 'g', lit une ligne, stocke et affiche."""
+        if not self.running:
+            return
+
+        # Gestion durée essai
+        elapsed = time.time() - self.start_time_pc
+        if elapsed >= TRIAL_DURATION:
+            self.stop_trial(auto=True)
+            return
+
+        # Envoi 'g'
+        try:
+            self.ser.write(b'g')
+            self.ser.flush()
+        except SerialException as e:
+            self.log_print(f"Erreur envoi 'g' : {e}")
+            self.stop_trial(auto=True)
+            return
+
+        # Lecture d'une trame
+        try:
+            line = self.ser.readline().decode(errors='ignore').strip()
+        except SerialException as e:
+            self.log_print(f"Erreur lecture série : {e}")
+            self.stop_trial(auto=True)
+            return
+
+        if line:
+            # On attend "time_ms,calibrated"
+            if ',' in line:
                 try:
                     t_str, v_str = line.split(',', 1)
                     t_ms = int(t_str)
                     val = float(v_str)
+                    t_s = t_ms / 1000.0
 
-                    # Temps Arduino en secondes
-                    times.append(t_ms / 1000.0)
-                    values.append(val)
+                    # Écriture dans le fichier
+                    if self.file:
+                        self.file.write(f"{t_s:.6f},{val:.6f}\n")
+
+                    # Affichage dans la log
+                    self.log_print(f"{t_s:.3f} s -> {val:.3f}")
                 except ValueError:
-                    pass
+                    self.log_print(f"Ligne non valide : {line}")
+            else:
+                self.log_print(f"Texte Arduino : {line}")
 
-            # Fin d'essai après TRIAL_DURATION secondes (côté PC)
-            if time.time() - t0_pc > TRIAL_DURATION:
-                ser.write(b'x')   # reset logiciel demandé
-                ser.flush()
-                break
+        # Replanifie l'appel
+        self.root.after(int(DT * 1000), self.schedule_read)
 
-            time.sleep(DT)
+    def stop_trial(self, auto: bool = False):
+        """Arrête l'essai en cours (auto ou par bouton Stop)."""
+        if not self.running:
+            return
 
-    except KeyboardInterrupt:
-        print("Arrêt manuel demandé")
-        ser.write(b'x')
-        ser.flush()
+        self.running = False
 
-    # Fermeture du port pour cet essai
-    ser.close()
-    print("Port fermé pour cet essai")
+        # Envoi 'x' pour reset UNO R4
+        if self.ser:
+            try:
+                self.ser.write(b'x')
+                self.ser.flush()
+                time.sleep(0.05)
+            except SerialException:
+                pass
 
-    # ----- Post-traitement de l'essai -----
-    if not times:
-        print("Aucune donnée reçue sur cet essai.")
-        continue
+        self.cleanup_serial_file()
 
-    # Temps relatif (0 s au début de l'essai)
-    t0_rel = times[0]
-    times_rel = [t - t0_rel for t in times]
+        # Incrémente le numéro d'essai
+        try:
+            trial = int(self.trial_var.get())
+        except ValueError:
+            trial = 1
+        self.trial_var.set(str(trial + 1))
 
-    print(f"T{trial:02d} : {len(times_rel)} échantillons")
-    print(f"  t0 = {times_rel[0]:.3f} s, t_end = {times_rel[-1]:.3f} s")
-    print(f"  val min = {min(values):.3f}, val max = {max(values):.3f}")
+        if auto:
+            self.set_status("Essai terminé automatiquement", "orange")
+            self.log_print(">>> Essai terminé (auto).")
+        else:
+            self.set_status("Essai stoppé manuellement", "red")
+            self.log_print(">>> Essai stoppé manuellement.")
 
-    # ----- Sauvegarde CSV pour cet essai -----
-    filename = f"{PREFIX}_T{trial:02d}.csv"
-    filepath = os.path.join(FOLDER, filename)
+    def cleanup_serial_file(self):
+        """Ferme proprement le port série et le fichier."""
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
 
-    with open(filepath, "w") as f:
-        f.write("time_s,value\n")
-        for t, v in zip(times_rel, values):
-            f.write(f"{t:.6f},{v:.6f}\n")
+        if self.file:
+            try:
+                self.file.close()
+            except Exception:
+                pass
+            self.file = None
 
-    print(f"Fichier enregistré : {filepath}")
+        self.start_time_pc = None
 
-    # ----- Graphe temporel (optionnel) -----
-    if SHOW_PLOTS:
-        plt.figure()
-        plt.plot(times_rel, values)
-        plt.xlabel("Temps (s)")
-        plt.ylabel("Valeur calibrée")
-        plt.title(f"Step 7 - Signal jauge (T{trial:02d})")
-        plt.grid(True)
-        plt.show()
+    def quit_app(self):
+        """Ferme l'application proprement."""
+        if self.running:
+            self.stop_trial(auto=False)
+        else:
+            self.cleanup_serial_file()
+        self.root.destroy()
 
-print("\nTous les essais sont terminés.")
+
+# --------- Point d'entrée ---------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = GaugeApp(root)
+    root.mainloop()
