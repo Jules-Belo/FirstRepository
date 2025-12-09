@@ -1,8 +1,5 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-## COUCOU
 
 import tkinter as tk
 from tkinter import filedialog, scrolledtext
@@ -11,33 +8,23 @@ import time
 import serial
 from serial import SerialException
 
-# ========= CONFIG À ADAPTER ==========
+# ========= CONFIG ==========
 PORT = '/dev/cu.usbmodem34B7DA6494902'
 BAUDRATE = 1000000
-TRIAL_DURATION = 10.0   # durée d'un essai en secondes
-DT = 0.01               # période d'envoi des 'g' (100 Hz)
-# =====================================
+TRIAL_DURATION = 10.0      # durée d'un essai (s)
+DT = 0.01                  # période d'envoi des 'g' (100 Hz)
+CALIB_DURATION = 2.0       # durée de calibration au début (s)
+
+# Dossier cible FIXE
+FOLDER_BASE = "/Users/julesbelo/Desktop/Cours/Master/M2/Github/GIT/FirstRepository/data"
+os.makedirs(FOLDER_BASE, exist_ok=True)
+# ===========================
 
 
 class GaugeApp:
-    """
-    IHM simple pour piloter la jauge via Arduino UNO R4.
-
-    - Bouton Start (10 s) :
-        * ouvre le port série
-        * envoie 'r'
-        * crée un fichier CSV
-        * envoie périodiquement 'g'
-        * lit "time_ms,calibrated" pendant 10 s
-    - Bouton Stop :
-        * envoie 'x' (reset Arduino)
-        * ferme port + fichier
-    - Affiche les trames reçues dans une zone de log.
-    """
-
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("IHM jauge de contrainte (UNO R4)")
+        self.root.title("IHM jauge de contrainte (UNO R4) - Calibration auto")
 
         # État interne
         self.running = False
@@ -45,11 +32,18 @@ class GaugeApp:
         self.file = None
         self.start_time_pc = None
 
+        # Calibration auto
+        self.calibrating = False
+        self.calib_start_time = None
+        self.calib_sum = 0.0
+        self.calib_count = 0
+        self.baseline = 0.0
+
         # --- Ligne 1 : info mode ---
         row = 0
         tk.Label(
             root,
-            text=f"Port Arduino : {PORT} - Durée essai : {TRIAL_DURATION:.0f} s"
+            text=f"Port Arduino : {PORT} - Essai : {TRIAL_DURATION:.0f} s (dont {CALIB_DURATION:.0f} s de calibration)"
         ).grid(row=row, column=0, columnspan=4, sticky="w", padx=5, pady=5)
 
         # --- Ligne 2 : préfixe et numéro d'essai ---
@@ -70,12 +64,12 @@ class GaugeApp:
             row=row, column=3, sticky="w", padx=5, pady=5
         )
 
-        # --- Ligne 3 : dossier cible ---
+        # --- Ligne 3 : dossier cible (pré-rempli avec ton chemin) ---
         row += 1
         tk.Label(root, text="Dossier :").grid(
             row=row, column=0, sticky="e", padx=5, pady=5
         )
-        self.folder_var = tk.StringVar(value=os.getcwd())
+        self.folder_var = tk.StringVar(value=os.path.abspath(FOLDER_BASE))
         tk.Entry(root, textvariable=self.folder_var, width=40).grid(
             row=row, column=1, columnspan=2, sticky="w", padx=5, pady=5
         )
@@ -99,13 +93,13 @@ class GaugeApp:
         tk.Button(
             root, text="Start (10 s)",
             command=self.start_trial,
-            bg="#2e7d32", fg="white", width=12
+            bg="#2e7d32", fg="brown", width=12
         ).grid(row=row, column=0, padx=5, pady=5)
 
         tk.Button(
             root, text="Stop",
             command=self.stop_trial,
-            bg="#c62828", fg="white", width=12
+            bg="#c62828", fg="brown", width=12
         ).grid(row=row, column=1, padx=5, pady=5)
 
         tk.Button(
@@ -118,7 +112,7 @@ class GaugeApp:
         self.log = scrolledtext.ScrolledText(root, width=90, height=20, state="disabled")
         self.log.grid(row=row, column=0, columnspan=4, padx=5, pady=5)
 
-    # ----------------- Utils UI -----------------
+    # ---------- Utils UI ----------
 
     def choose_folder(self):
         folder = filedialog.askdirectory(initialdir=self.folder_var.get())
@@ -135,12 +129,11 @@ class GaugeApp:
         self.log.see(tk.END)
         self.log.config(state="disabled")
 
-    # ----------------- Gestion essai -----------------
+    # ---------- Gestion essai ----------
 
     def start_trial(self):
-        """Démarre un essai de TRIAL_DURATION secondes."""
         if self.running:
-            return  # Essai déjà en cours
+            return
 
         prefix = self.prefix_var.get().strip()
         folder = self.folder_var.get().strip()
@@ -159,7 +152,7 @@ class GaugeApp:
 
         try:
             self.file = open(filepath, "w")
-            self.file.write("time_s,value\n")  # en-tête
+            self.file.write("time_s,value\n")
         except Exception as e:
             self.set_status("Erreur ouverture fichier", "red")
             self.log_print(f"Erreur fichier : {e}")
@@ -177,7 +170,7 @@ class GaugeApp:
             self.ser = None
             return
 
-        time.sleep(2.0)  # reset UNO R4 après ouverture
+        time.sleep(2.0)
         self.ser.reset_input_buffer()
 
         # Envoi 'r'
@@ -190,22 +183,34 @@ class GaugeApp:
             self.cleanup_serial_file()
             return
 
+        # Init état essai + calibration
         self.running = True
         self.start_time_pc = time.time()
-        self.set_status(f"Essai T{trial:02d} en cours ({TRIAL_DURATION:.0f} s)", "green")
-        self.log_print(f">>> Start T{trial:02d}, fichier : {filepath}")
 
-        # Lancer la boucle de lecture/écriture non bloquante
+        self.calibrating = True
+        self.calib_start_time = self.start_time_pc
+        self.calib_sum = 0.0
+        self.calib_count = 0
+        self.baseline = 0.0
+
+        self.set_status(
+            f"Essai T{trial:02d} en cours ({TRIAL_DURATION:.0f} s) - Calibration...",
+            "green"
+        )
+        self.log_print(f">>> Start T{trial:02d}, fichier : {filepath}")
+        self.log_print(f">>> Calibration pendant {CALIB_DURATION:.1f} s, ne pas toucher la jauge...")
+
         self.schedule_read()
 
     def schedule_read(self):
-        """Tâche périodique : demande 'g', lit une ligne, stocke et affiche."""
         if not self.running:
             return
 
-        # Gestion durée essai
-        elapsed = time.time() - self.start_time_pc
-        if elapsed >= TRIAL_DURATION:
+        now = time.time()
+        elapsed_total = now - self.start_time_pc
+
+        # Fin d'essai ?
+        if elapsed_total >= TRIAL_DURATION:
             self.stop_trial(auto=True)
             return
 
@@ -218,7 +223,7 @@ class GaugeApp:
             self.stop_trial(auto=True)
             return
 
-        # Lecture d'une trame
+        # Lecture
         try:
             line = self.ser.readline().decode(errors='ignore').strip()
         except SerialException as e:
@@ -227,7 +232,6 @@ class GaugeApp:
             return
 
         if line:
-            # On attend "time_ms,calibrated"
             if ',' in line:
                 try:
                     t_str, v_str = line.split(',', 1)
@@ -235,22 +239,51 @@ class GaugeApp:
                     val = float(v_str)
                     t_s = t_ms / 1000.0
 
-                    # Écriture dans le fichier
-                    if self.file:
-                        self.file.write(f"{t_s:.6f},{val:.6f}\n")
+                    # ----- CALIBRATION AUTO -----
+                    if self.calibrating:
+                        elapsed_calib = now - self.calib_start_time
+                        # on accumule pendant CALIB_DURATION
+                        if elapsed_calib <= CALIB_DURATION:
+                            self.calib_sum += val
+                            self.calib_count += 1
+                            # on log un peu moins souvent pour pas spammer
+                            if self.calib_count % 50 == 0:
+                                self.log_print(f"[CALIB] t={t_s:.3f}s raw={val:.3f}")
+                        else:
+                            # fin de calibration -> baseline = moyenne
+                            if self.calib_count > 0:
+                                self.baseline = self.calib_sum / self.calib_count
+                            else:
+                                self.baseline = val  # fallback
+                            self.calibrating = False
+                            self.log_print(f">>> Calibration terminée. Baseline = {self.baseline:.3f}")
+                            self.set_status("Acquisition en cours (données calibrées)", "green")
+                    else:
+                        # ----- PHASE MESURE (après calibration) -----
+                        # On soustrait la baseline
+                        val_cal = val - self.baseline
+                        # Clamp 0-1000
+                        if val_cal < 0:
+                            val_cal = 0.0
+                        if val_cal > 1000:
+                            val_cal = 1000.0
 
-                    # Affichage dans la log
-                    self.log_print(f"{t_s:.3f} s -> {val:.3f}")
+                        # Enregistrement
+                        if self.file:
+                            self.file.write(f"{t_s:.6f},{val_cal:.6f}\n")
+
+                        # Affichage
+                        self.log_print(f"{t_s:.3f} s -> {val_cal:.3f} (raw={val:.3f})")
+
                 except ValueError:
                     self.log_print(f"Ligne non valide : {line}")
             else:
                 self.log_print(f"Texte Arduino : {line}")
 
-        # Replanifie l'appel
+        # Replanifie la prochaine lecture
         self.root.after(int(DT * 1000), self.schedule_read)
 
     def stop_trial(self, auto: bool = False):
-        """Arrête l'essai en cours (auto ou par bouton Stop)."""
         if not self.running:
             return
 
@@ -267,7 +300,7 @@ class GaugeApp:
 
         self.cleanup_serial_file()
 
-        # Incrémente le numéro d'essai
+        # Incrémente le n° d'essai
         try:
             trial = int(self.trial_var.get())
         except ValueError:
@@ -282,7 +315,6 @@ class GaugeApp:
             self.log_print(">>> Essai stoppé manuellement.")
 
     def cleanup_serial_file(self):
-        """Ferme proprement le port série et le fichier."""
         if self.ser:
             try:
                 self.ser.close()
@@ -298,17 +330,26 @@ class GaugeApp:
             self.file = None
 
         self.start_time_pc = None
+        self.calibrating = False
 
     def quit_app(self):
-        """Ferme l'application proprement."""
-        if self.running:
-            self.stop_trial(auto=False)
-        else:
-            self.cleanup_serial_file()
-        self.root.destroy()
+        # On arrête la boucle
+        self.running = False
+
+        # On essaye d'envoyer 'x' si le port est ouvert
+        if self.ser:
+            try:
+                self.ser.write(b'x')
+                self.ser.flush()
+            except SerialException:
+                pass
+
+        self.cleanup_serial_file()
+
+        # On laisse Tkinter fermer proprement
+        self.root.after(50, self.root.destroy)
 
 
-# --------- Point d'entrée ---------
 if __name__ == "__main__":
     root = tk.Tk()
     app = GaugeApp(root)
