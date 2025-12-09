@@ -13,9 +13,8 @@ PORT = '/dev/cu.usbmodem34B7DA6494902'
 BAUDRATE = 1000000
 TRIAL_DURATION = 10.0      # durée d'un essai (s)
 DT = 0.01                  # période d'envoi des 'g' (100 Hz)
-CALIB_DURATION = 2.0       # durée de calibration au début (s)
 
-# Dossier cible FIXE
+# ✅ Dossier cible FIXE
 FOLDER_BASE = "/Users/julesbelo/Desktop/Cours/Master/M2/Github/GIT/FirstRepository/data"
 os.makedirs(FOLDER_BASE, exist_ok=True)
 # ===========================
@@ -24,26 +23,19 @@ os.makedirs(FOLDER_BASE, exist_ok=True)
 class GaugeApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("IHM jauge de contrainte (UNO R4) - Calibration auto")
+        self.root.title("IHM jauge de contrainte (UNO R4)")
 
         # État interne
         self.running = False
-        self.ser: serial.Serial | None = None
+        self.ser = None
         self.file = None
         self.start_time_pc = None
-
-        # Calibration auto
-        self.calibrating = False
-        self.calib_start_time = None
-        self.calib_sum = 0.0
-        self.calib_count = 0
-        self.baseline = 0.0
 
         # --- Ligne 1 : info mode ---
         row = 0
         tk.Label(
             root,
-            text=f"Port Arduino : {PORT} - Essai : {TRIAL_DURATION:.0f} s (dont {CALIB_DURATION:.0f} s de calibration)"
+            text=f"Port Arduino : {PORT} - Essai : {TRIAL_DURATION:.0f} s"
         ).grid(row=row, column=0, columnspan=4, sticky="w", padx=5, pady=5)
 
         # --- Ligne 2 : préfixe et numéro d'essai ---
@@ -64,7 +56,7 @@ class GaugeApp:
             row=row, column=3, sticky="w", padx=5, pady=5
         )
 
-        # --- Ligne 3 : dossier cible (pré-rempli avec ton chemin) ---
+        # --- Ligne 3 : dossier cible ---
         row += 1
         tk.Label(root, text="Dossier :").grid(
             row=row, column=0, sticky="e", padx=5, pady=5
@@ -93,13 +85,13 @@ class GaugeApp:
         tk.Button(
             root, text="Start (10 s)",
             command=self.start_trial,
-            bg="#2e7d32", fg="brown", width=12
+            bg="#2e7d32", fg="white", width=12
         ).grid(row=row, column=0, padx=5, pady=5)
 
         tk.Button(
             root, text="Stop",
             command=self.stop_trial,
-            bg="#c62828", fg="brown", width=12
+            bg="#c62828", fg="white", width=12
         ).grid(row=row, column=1, padx=5, pady=5)
 
         tk.Button(
@@ -167,7 +159,6 @@ class GaugeApp:
             self.log_print(f"Erreur série : {e}")
             self.file.close()
             self.file = None
-            self.ser = None
             return
 
         time.sleep(2.0)
@@ -183,22 +174,11 @@ class GaugeApp:
             self.cleanup_serial_file()
             return
 
-        # Init état essai + calibration
         self.running = True
         self.start_time_pc = time.time()
 
-        self.calibrating = True
-        self.calib_start_time = self.start_time_pc
-        self.calib_sum = 0.0
-        self.calib_count = 0
-        self.baseline = 0.0
-
-        self.set_status(
-            f"Essai T{trial:02d} en cours ({TRIAL_DURATION:.0f} s) - Calibration...",
-            "green"
-        )
+        self.set_status(f"Essai T{trial:02d} en cours ({TRIAL_DURATION:.0f} s)", "green")
         self.log_print(f">>> Start T{trial:02d}, fichier : {filepath}")
-        self.log_print(f">>> Calibration pendant {CALIB_DURATION:.1f} s, ne pas toucher la jauge...")
 
         self.schedule_read()
 
@@ -206,11 +186,8 @@ class GaugeApp:
         if not self.running:
             return
 
-        now = time.time()
-        elapsed_total = now - self.start_time_pc
-
-        # Fin d'essai ?
-        if elapsed_total >= TRIAL_DURATION:
+        elapsed = time.time() - self.start_time_pc
+        if elapsed >= TRIAL_DURATION:
             self.stop_trial(auto=True)
             return
 
@@ -231,56 +208,23 @@ class GaugeApp:
             self.stop_trial(auto=True)
             return
 
-        if line:
-            if ',' in line:
-                try:
-                    t_str, v_str = line.split(',', 1)
-                    t_ms = int(t_str)
-                    val = float(v_str)
-                    t_s = t_ms / 1000.0
+        if line and ',' in line:
+            try:
+                t_str, v_str = line.split(',', 1)
+                t_ms = int(t_str)
+                val = float(v_str)
 
-                    # ----- CALIBRATION AUTO -----
-                    if self.calibrating:
-                        elapsed_calib = now - self.calib_start_time
-                        # on accumule pendant CALIB_DURATION
-                        if elapsed_calib <= CALIB_DURATION:
-                            self.calib_sum += val
-                            self.calib_count += 1
-                            # on log un peu moins souvent pour pas spammer
-                            if self.calib_count % 50 == 0:
-                                self.log_print(f"[CALIB] t={t_s:.3f}s raw={val:.3f}")
-                        else:
-                            # fin de calibration -> baseline = moyenne
-                            if self.calib_count > 0:
-                                self.baseline = self.calib_sum / self.calib_count
-                            else:
-                                self.baseline = val  # fallback
-                            self.calibrating = False
-                            self.log_print(f">>> Calibration terminée. Baseline = {self.baseline:.3f}")
-                            self.set_status("Acquisition en cours (données calibrées)", "green")
-                    else:
-                        # ----- PHASE MESURE (après calibration) -----
-                        # On soustrait la baseline
-                        val_cal = val - self.baseline
-                        # Clamp 0-1000
-                        if val_cal < 0:
-                            val_cal = 0.0
-                        if val_cal > 1000:
-                            val_cal = 1000.0
+                t_s = t_ms / 1000.0
+                val_cal = val
 
-                        # Enregistrement
-                        if self.file:
-                            self.file.write(f"{t_s:.6f},{val_cal:.6f}\n")
+                if self.file:
+                    self.file.write(f"{t_s:.6f},{val_cal:.6f}\n")
 
-                        # Affichage
-                        self.log_print(f"{t_s:.3f} s -> {val_cal:.3f} (raw={val:.3f})")
+                self.log_print(f"{t_s:.3f} s -> {val_cal:.3f}")
 
-                except ValueError:
-                    self.log_print(f"Ligne non valide : {line}")
-            else:
-                self.log_print(f"Texte Arduino : {line}")
+            except ValueError:
+                self.log_print(f"Ligne non valide : {line}")
 
-        # Replanifie la prochaine lecture
         self.root.after(int(DT * 1000), self.schedule_read)
 
     def stop_trial(self, auto: bool = False):
@@ -289,7 +233,7 @@ class GaugeApp:
 
         self.running = False
 
-        # Envoi 'x' pour reset UNO R4
+        # Reset Arduino
         if self.ser:
             try:
                 self.ser.write(b'x')
@@ -300,7 +244,6 @@ class GaugeApp:
 
         self.cleanup_serial_file()
 
-        # Incrémente le n° d'essai
         try:
             trial = int(self.trial_var.get())
         except ValueError:
@@ -330,13 +273,10 @@ class GaugeApp:
             self.file = None
 
         self.start_time_pc = None
-        self.calibrating = False
 
     def quit_app(self):
-        # On arrête la boucle
         self.running = False
 
-        # On essaye d'envoyer 'x' si le port est ouvert
         if self.ser:
             try:
                 self.ser.write(b'x')
@@ -345,8 +285,6 @@ class GaugeApp:
                 pass
 
         self.cleanup_serial_file()
-
-        # On laisse Tkinter fermer proprement
         self.root.after(50, self.root.destroy)
 
 
